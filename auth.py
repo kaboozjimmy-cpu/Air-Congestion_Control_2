@@ -203,6 +203,11 @@ def register_user(email, password, full_name='', requested_role='user'):
         _firebase_request('update', {
             'idToken': data['idToken'], 'displayName': full_name, 'returnSecureToken': False
         })
+        # Send verification email
+        _firebase_request('sendOobCode', {
+            'requestType': 'VERIFY_EMAIL',
+            'idToken': data['idToken']
+        })
 
     uid = data.get('localId', '')
 
@@ -258,6 +263,13 @@ def login_user(email, password):
         _record_attempt(email, False)
         _log_audit('', email, 'LOGIN_FAILED', str(data))
         return False, data
+
+    # Check email verified
+    ok2, info = _firebase_request('lookup', {'idToken': data['idToken']})
+    if ok2:
+        users_list = info.get('users', [])
+        if users_list and not users_list[0].get('emailVerified', False):
+            return False, "Please verify your email first. Check your inbox for the verification link."
 
     _record_attempt(email, True)
     uid = data.get('localId', '')
