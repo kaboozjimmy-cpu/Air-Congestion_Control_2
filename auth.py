@@ -8,10 +8,8 @@ import re
 import json
 import time
 import sqlite3
-import hashlib
 import requests
 from datetime import datetime, timedelta
-from functools import wraps
 
 try:
     from dotenv import load_dotenv
@@ -35,7 +33,7 @@ LOCKOUT_MINUTES = 15
 
 
 # ═══════════════════════════════════════
-#  LOCAL ROLE DB (maps Firebase UID → role)
+#  LOCAL ROLE DB
 # ═══════════════════════════════════════
 
 def _get_db():
@@ -78,11 +76,10 @@ def _log_audit(uid, email, action, details=''):
 
 
 # ═══════════════════════════════════════
-#  SECURITY: Rate Limiting + Brute Force
+#  SECURITY
 # ═══════════════════════════════════════
 
 def _check_rate_limit(email):
-    """Check if email is locked out from too many failed attempts."""
     conn = _get_db()
     cutoff = time.time() - (LOCKOUT_MINUTES * 60)
     rows = conn.execute(
@@ -104,12 +101,7 @@ def _record_attempt(email, success):
     conn.close()
 
 
-# ═══════════════════════════════════════
-#  SECURITY: Input Validation
-# ═══════════════════════════════════════
-
 def _sanitize(text, max_len=200):
-    """Strip dangerous characters from user input."""
     if not text:
         return ''
     text = str(text)[:max_len].strip()
@@ -123,7 +115,6 @@ def _validate_email(email):
 
 
 def _validate_password(password):
-    """Enforce password strength."""
     if len(password) < 8:
         return False, "Password must be at least 8 characters"
     if not re.search(r'[A-Z]', password):
@@ -173,12 +164,10 @@ def _firebase_request(endpoint, payload):
 
 
 # ═══════════════════════════════════════
-#  REGISTER / LOGIN / SESSION
+#  REGISTER
 # ═══════════════════════════════════════
 
 def register_user(email, password, full_name='', requested_role='user'):
-    """Register via Firebase + store role locally.
-    First user auto-becomes admin. Controllers need admin approval."""
     email = _sanitize(email).lower()
     full_name = _sanitize(full_name)
 
@@ -198,20 +187,25 @@ def register_user(email, password, full_name='', requested_role='user'):
     if not ok:
         return False, data
 
+    id_token = data.get('idToken', '')
+
     # Set display name
-    if data.get('idToken'):
+    if id_token:
         _firebase_request('update', {
-            'idToken': data['idToken'], 'displayName': full_name, 'returnSecureToken': False
+            'idToken': id_token,
+            'displayName': full_name,
+            'returnSecureToken': False
         })
-        # Send verification email
-        _firebase_request('sendOobCode', {
+        # Send email verification
+        ver_ok, ver_msg = _firebase_request('sendOobCode', {
             'requestType': 'VERIFY_EMAIL',
-            'idToken': data['idToken']
+            'idToken': id_token
         })
+        if not ver_ok:
+            print(f"[auth] Verification email failed: {ver_msg}")
 
     uid = data.get('localId', '')
 
-    # First user becomes admin automatically
     conn = _get_db()
     user_count = conn.execute("SELECT COUNT(*) FROM user_roles").fetchone()[0]
     if user_count == 0:
@@ -219,7 +213,7 @@ def register_user(email, password, full_name='', requested_role='user'):
         approved = 1
     elif requested_role == 'controller':
         role = 'controller'
-        approved = 0  # needs admin approval
+        approved = 0
     else:
         role = requested_role
         approved = 1
@@ -236,7 +230,7 @@ def register_user(email, password, full_name='', requested_role='user'):
     user = {
         'uid': uid, 'email': email, 'full_name': full_name,
         'role': role, 'approved': approved,
-        'id_token': data.get('idToken', ''),
+        'id_token': id_token,
         'refresh_token': data.get('refreshToken', ''),
         'login_time': time.time(),
     }
@@ -246,8 +240,11 @@ def register_user(email, password, full_name='', requested_role='user'):
     return True, user
 
 
+# ═══════════════════════════════════════
+#  LOGIN
+# ═══════════════════════════════════════
+
 def login_user(email, password):
-    """Login via Firebase + fetch local role."""
     email = _sanitize(email).lower()
     if not email or not password:
         return False, "Please fill in all fields"
@@ -264,24 +261,25 @@ def login_user(email, password):
         _log_audit('', email, 'LOGIN_FAILED', str(data))
         return False, data
 
+    id_token = data.get('idToken', '')
+
     # Check email verified
-    ok2, info = _firebase_request('lookup', {'idToken': data['idToken']})
+    ok2, info = _firebase_request('lookup', {'idToken': id_token})
     if ok2:
         users_list = info.get('users', [])
         if users_list and not users_list[0].get('emailVerified', False):
-            return False, "Please verify your email first. Check your inbox for the verification link."
+            _record_attempt(email, False)
+            return False, "⚠️ Email not verified. Please check your inbox and click the verification link, then try again."
 
     _record_attempt(email, True)
     uid = data.get('localId', '')
 
     # Get display name
     display_name = data.get('displayName', '')
-    if not display_name:
-        ok2, info = _firebase_request('lookup', {'idToken': data['idToken']})
-        if ok2:
-            users = info.get('users', [])
-            if users:
-                display_name = users[0].get('displayName', '')
+    if not display_name and ok2:
+        users = info.get('users', [])
+        if users:
+            display_name = users[0].get('displayName', '')
 
     # Get role from local DB
     conn = _get_db()
@@ -307,7 +305,7 @@ def login_user(email, password):
         'uid': uid, 'email': email,
         'full_name': display_name or email.split('@')[0],
         'role': role, 'approved': approved,
-        'id_token': data.get('idToken', ''),
+        'id_token': id_token,
         'refresh_token': data.get('refreshToken', ''),
         'login_time': time.time(),
     }
@@ -317,8 +315,11 @@ def login_user(email, password):
     return True, user
 
 
+# ═══════════════════════════════════════
+#  SESSION
+# ═══════════════════════════════════════
+
 def check_session_valid(user):
-    """Check if session has timed out."""
     if not user:
         return False
     login_time = user.get('login_time', 0)
