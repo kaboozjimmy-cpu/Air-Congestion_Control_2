@@ -229,7 +229,10 @@ def render_auth():
                 if st.button("Send Reset Link", key="r_btn"):
                     if re:
                         ok, msg = send_password_reset(re)
-                        st.success(msg) if ok else st.error(msg)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
         with t2:
             with st.form("reg_form"):
                 st.markdown("##### Create your account")
