@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+data/roles.db
+data/synthetic_atc_data.csv
+models/xgboost_model.pkl
+models/scaler.pkl
+models/lstm_model.keras
+models/lstm_model.h5
+models/shap_data.json
+models/meta.json
+*.db
